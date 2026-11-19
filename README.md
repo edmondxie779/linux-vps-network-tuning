@@ -13,12 +13,12 @@
 
 **root 用户（或 Alpine Linux）：**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/edmondxie779/net-tune/main/net-tune.sh -o /usr/local/bin/net-tune && chmod +x /usr/local/bin/net-tune && net-tune
+curl -fsSL https://raw.githubusercontent.com/edmondxie779/linux-vps-network-tuning/main/net-tune.sh -o /usr/local/bin/net-tune && chmod +x /usr/local/bin/net-tune && net-tune
 ```
 
 **非 root 普通用户（带 `sudo`）：**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/edmondxie779/net-tune/main/net-tune.sh -o /tmp/net-tune.sh && sudo sh /tmp/net-tune.sh --install
+curl -fsSL https://raw.githubusercontent.com/edmondxie779/linux-vps-network-tuning/main/net-tune.sh -o /tmp/net-tune.sh && sudo sh /tmp/net-tune.sh --install
 ```
 
 > 安装完成后，以后任意时候登录 SSH 直接输入 `net-tune`（或 `sudo net-tune`）即可再次唤起面板！
@@ -28,9 +28,9 @@ curl -fsSL https://raw.githubusercontent.com/edmondxie779/net-tune/main/net-tune
 不想进菜单手动选，直接一行命令装好 `net-tune` 并开启 **均衡通用档（BBR + FQ + 内存自适应缓冲 + 全局句柄 + 网卡多队列 RPS）**：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/edmondxie779/net-tune/main/net-tune.sh | sudo sh -s -- --auto
+curl -fsSL https://raw.githubusercontent.com/edmondxie779/linux-vps-network-tuning/main/net-tune.sh | sudo sh -s -- --auto
 ```
-*(若当前已是 `root` 且系统无 `sudo`，去掉 `sudo ` 即可：`curl -fsSL https://raw.githubusercontent.com/edmondxie779/net-tune/main/net-tune.sh | sh -s -- --auto`)*
+*(若当前已是 `root` 且系统无 `sudo`，去掉 `sudo ` 即可：`curl -fsSL https://raw.githubusercontent.com/edmondxie779/linux-vps-network-tuning/main/net-tune.sh | sh -s -- --auto`)*
 
 ---
 

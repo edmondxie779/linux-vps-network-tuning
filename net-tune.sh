@@ -32,7 +32,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
             exec bash "$0" "$@"
         else
             # 通过 curl ... | sh 管道调用时，自动拉取到临时或系统路径再交由 bash 执行
-            _bootstrap_url="https://raw.githubusercontent.com/edmondxie779/net-tune/main/net-tune.sh"
+            _bootstrap_url="https://raw.githubusercontent.com/edmondxie779/linux-vps-network-tuning/main/net-tune.sh"
             _bootstrap_dst="/tmp/net-tune.$$.sh"
             [ "$(id -u)" -eq 0 ] && [ -d /usr/local/bin ] && _bootstrap_dst="/usr/local/bin/net-tune"
             if command -v curl >/dev/null 2>&1; then
@@ -54,8 +54,8 @@ set -u
 
 # ============================= 全局常量与路径 =================================
 readonly SCRIPT_VERSION="1.0.0"
-readonly REPO_URL="https://github.com/edmondxie779/net-tune"
-readonly REPO_RAW_URL="https://raw.githubusercontent.com/edmondxie779/net-tune/main/net-tune.sh"
+readonly REPO_URL="https://github.com/edmondxie779/linux-vps-network-tuning"
+readonly REPO_RAW_URL="https://raw.githubusercontent.com/edmondxie779/linux-vps-network-tuning/main/net-tune.sh"
 readonly INSTALL_BIN="/usr/local/bin/net-tune"
 readonly SYMLINK_BIN="/usr/bin/net-tune"
 readonly STATE_DIR="/etc/net-tune"
