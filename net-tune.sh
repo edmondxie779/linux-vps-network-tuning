@@ -53,7 +53,7 @@ fi
 set -u
 
 # ============================= 全局常量与路径 =================================
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly REPO_URL="https://github.com/edmondxie779/linux-vps-network-tuning"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/edmondxie779/linux-vps-network-tuning/main/net-tune.sh"
 readonly INSTALL_BIN="/usr/local/bin/net-tune"
@@ -77,10 +77,13 @@ readonly SYSTEMD_NIC_SVC="/etc/systemd/system/net-tune-nic.service"
 readonly OPENRC_ULIMIT_SH="/etc/profile.d/99-net-tune-ulimit.sh"
 readonly OPENRC_NIC_START="/etc/local.d/99-net-tune-nic.start"
 
+readonly SYSCTL_CONNTRACK="/etc/sysctl.d/98-net-tune-conntrack.conf"
+
 readonly TARGET_NOFILE=1048576
 
 # ============================= 终端彩色输出 ===================================
-if [ -t 1 ]; then
+# 遵循 NO_COLOR 约定 (https://no-color.org)
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ]; then
     C_RESET=$'\033[0m'
     C_BOLD=$'\033[1m'
     C_DIM=$'\033[2m'
@@ -104,7 +107,58 @@ log_info()  { printf '%s[INFO]%s %s\n' "${C_CYAN}" "${C_RESET}" "$*"; }
 log_ok()    { printf '%s[ OK ]%s %s\n' "${C_GREEN}" "${C_RESET}" "$*"; }
 log_warn()  { printf '%s[WARN]%s %s\n' "${C_YELLOW}" "${C_RESET}" "$*" >&2; }
 log_err()   { printf '%s[ERR ]%s %s\n' "${C_RED}" "${C_RESET}" "$*" >&2; }
-print_hr()  { printf '%s----------------------------------------------------------------------%s\n' "${C_DIM}" "${C_RESET}"; }
+print_hr()  { printf '%s  ------------------------------------------------------------------%s\n' "${C_DIM}" "${C_RESET}"; }
+print_hr2() { printf '%s======================================================================%s\n' "${C_BLUE}${C_BOLD}" "${C_RESET}"; }
+
+# 状态符号：UTF-8 终端使用 ✔ / ✘，否则回退为 ASCII
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) SYM_OK="✔"; SYM_BAD="✘"; SYM_WARN="!" ;;
+    *) SYM_OK="OK"; SYM_BAD="X"; SYM_WARN="!" ;;
+esac
+mark_ok()   { printf '%s%s%s' "${C_GREEN}" "$SYM_OK" "${C_RESET}"; }
+mark_bad()  { printf '%s%s%s' "${C_RED}" "$SYM_BAD" "${C_RESET}"; }
+mark_warn() { printf '%s%s%s' "${C_YELLOW}" "$SYM_WARN" "${C_RESET}"; }
+
+# 计算字符串在终端中的显示宽度 (ASCII 占 1 列，UTF-8 中日韩字符占 2 列)
+# 不依赖系统 locale，在 LANG=C 的极简 VPS 上同样准确。结果写入全局变量 STR_WIDTH。
+str_width() {
+    local s="$1"
+    local LC_ALL=C
+    # 先剔除 ANSI 颜色转义序列，它们不占显示宽度
+    local esc_re=$'\033''\[[0-9;]*m'
+    while [[ "$s" =~ $esc_re ]]; do
+        s="${s/"${BASH_REMATCH[0]}"/}"
+    done
+    local bytes="${#s}"
+    local ascii="${s//[^ -~]/}"
+    local non_ascii=$(( bytes - ${#ascii} ))
+    STR_WIDTH=$(( ${#ascii} + non_ascii * 2 / 3 ))
+}
+
+# 按显示宽度右侧补齐空格 (修复 printf %-Ns 对中文按字节计数导致的错位)
+pad_to() {
+    local s="$1"
+    local width="$2"
+    str_width "$s"
+    local n=$(( width - STR_WIDTH ))
+    [ "$n" -lt 0 ] && n=0
+    printf '%s%*s' "$s" "$n" ""
+}
+
+# 仪表盘的一行 "标签 : 值"
+kv_row() {
+    printf '  %s%s%s : %s\n' "${C_DIM}" "$(pad_to "$1" 16)" "${C_RESET}" "$2"
+}
+
+section_title() {
+    printf '\n  %s%s%s\n' "${C_BOLD}${C_CYAN}" "$1" "${C_RESET}"
+}
+
+clear_screen() {
+    if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ -z "${NET_TUNE_NO_CLEAR:-}" ]; then
+        printf '\033[H\033[2J'
+    fi
+}
 
 # ============================= 系统环境探测 ===================================
 OS_ID="unknown"
@@ -364,6 +418,10 @@ SNAPSHOT_KEYS=(
     net.ipv4.udp_rmem_min
     net.ipv4.udp_wmem_min
     net.ipv4.tcp_fastopen
+    net.ipv4.tcp_sack
+    net.ipv4.tcp_dsack
+    net.ipv4.tcp_window_scaling
+    net.ipv4.tcp_timestamps
     net.ipv4.tcp_slow_start_after_idle
     net.ipv4.tcp_mtu_probing
     net.ipv4.tcp_tw_reuse
@@ -381,29 +439,69 @@ SNAPSHOT_KEYS=(
     net.ipv4.ip_local_port_range
     net.ipv4.ip_forward
     net.ipv6.conf.all.forwarding
+    net.ipv6.conf.default.forwarding
+    net.core.rps_sock_flow_entries
     fs.file-max
     fs.nr_open
     vm.swappiness
     vm.vfs_cache_pressure
     net.netfilter.nf_conntrack_max
     net.netfilter.nf_conntrack_tcp_timeout_established
+    net.netfilter.nf_conntrack_tcp_timeout_time_wait
+    net.netfilter.nf_conntrack_tcp_timeout_close_wait
+    net.netfilter.nf_conntrack_tcp_timeout_fin_wait
     net.netfilter.nf_conntrack_udp_timeout
     net.netfilter.nf_conntrack_udp_timeout_stream
 )
+
+# 将某个键的「调优前原始值」记入快照 (每个键只记录一次)。
+# 每次写入参数前都会调用，因此后来才出现的键 (如之后才加载的 nf_conntrack) 也能被完整回滚。
+snapshot_key() {
+    local key="$1"
+    [ -f "$SYSCTL_SNAPSHOT" ] || return 0
+    grep -q "^${key}=" "$SYSCTL_SNAPSHOT" 2>/dev/null && return 0
+    local val
+    val="$(read_sysctl "$key")"
+    [ "$val" != "N/A" ] && printf '%s=%s\n' "$key" "$val" >> "$SYSCTL_SNAPSHOT"
+    return 0
+}
+
+# 读取某个键调优前的原始值 (快照优先，否则取当前值)
+baseline_value() {
+    local key="$1"
+    local val=""
+    if [ -f "$SYSCTL_SNAPSHOT" ]; then
+        val="$(grep "^${key}=" "$SYSCTL_SNAPSHOT" 2>/dev/null | head -n 1 | cut -d= -f2-)"
+    fi
+    [ -z "$val" ] && val="$(read_sysctl "$key")"
+    printf '%s' "$val"
+}
+
+# 「只升不降」：返回 max(系统原始值, 目标值)。
+# 避免把 systemd 默认的 fs.nr_open=1073741816 / fs.file-max=LONG_MAX 等更大的值反向调低。
+raise_value() {
+    local key="$1"
+    local target="$2"
+    local base
+    base="$(baseline_value "$key")"
+    if printf '%s' "$base" | grep -qE '^[0-9]{1,19}$' && [ "$base" -gt "$target" ] 2>/dev/null; then
+        printf '%s' "$base"
+    else
+        printf '%s' "$target"
+    fi
+}
 
 ensure_initial_backup() {
     mkdir -p "$BACKUP_FILES_DIR"
     if [ ! -f "$SYSCTL_SNAPSHOT" ]; then
         log_info "首次调优：正在创建系统初始参数快照 (${BACKUP_DIR})..."
         : > "$SYSCTL_SNAPSHOT"
-        local k val
-        for k in "${SNAPSHOT_KEYS[@]}"; do
-            val="$(read_sysctl "$k")"
-            if [ "$val" != "N/A" ]; then
-                printf '%s=%s\n' "$k" "$val" >> "$SYSCTL_SNAPSHOT"
-            fi
-        done
     fi
+    # 首次创建，或为旧版本快照补齐新增的键 (已存在的键不会被覆盖)
+    local k
+    for k in "${SNAPSHOT_KEYS[@]}"; do
+        snapshot_key "$k"
+    done
 
     local cfg base
     for cfg in /etc/gai.conf /etc/rc.conf /etc/fstab /etc/sysctl.conf; do
@@ -424,19 +522,35 @@ backup_file_once() {
 }
 
 # ============================= 内核模块与拥塞队列 =============================
+# 合并写入开机加载模块列表：保留已登记的模块 (如 nf_conntrack)，只追加新的，
+# 且只登记当前内核确实存在 (可加载或已内建) 的模块，避免开机 systemd-modules-load 报错。
 persist_kernel_modules() {
     mkdir -p /etc/modules-load.d
-    cat > "$MODULES_CONF" <<EOF
-# Managed by net-tune.sh
-tcp_bbr
-EOF
-    local mod
+    local -a mods=()
+    local mod existing
+    if [ -f "$MODULES_CONF" ]; then
+        while IFS= read -r mod; do
+            case "$mod" in ''|'#'*) continue ;; esac
+            mods+=("$mod")
+        done < "$MODULES_CONF"
+    fi
     for mod in "$@"; do
         [ -z "$mod" ] && continue
-        if ! grep -qx "$mod" "$MODULES_CONF" 2>/dev/null; then
-            printf '%s\n' "$mod" >> "$MODULES_CONF"
+        if command -v modprobe >/dev/null 2>&1 && ! modprobe -n -q "$mod" >/dev/null 2>&1; then
+            continue
         fi
+        for existing in "${mods[@]}"; do
+            [ "$existing" = "$mod" ] && continue 2
+        done
+        mods+=("$mod")
     done
+
+    {
+        printf '# Managed by net-tune.sh\n'
+        for mod in "${mods[@]}"; do
+            printf '%s\n' "$mod"
+        done
+    } > "$MODULES_CONF"
 
     if [ "$INIT_SYSTEM" = "openrc" ] && command -v rc-update >/dev/null 2>&1; then
         rc-update add modules boot >/dev/null 2>&1 || true
@@ -486,11 +600,62 @@ ensure_qdisc_available() {
     return 1
 }
 
+# 实时切换网卡队列 (POSIX sh 实现，主脚本与开机 NIC 脚本共用同一份代码)
+#  - 单队列网卡: 直接替换 root qdisc
+#  - 多队列网卡 (virtio-net / ENA / gVNIC 等): 保留 mq 根，只替换每个 TX 子队列，
+#    避免用单一 root qdisc 取代 mq 导致所有 TX 队列争抢同一把锁、多核吞吐下降
+readonly NT_QDISC_FN='
+nt_set_qdisc() {
+    _nt_dev="$1"; _nt_q="$2"
+    command -v tc >/dev/null 2>&1 || return 0
+    [ -d "/sys/class/net/${_nt_dev}" ] || return 0
+    _nt_ntx=0
+    for _nt_t in /sys/class/net/"${_nt_dev}"/queues/tx-*; do
+        [ -d "${_nt_t}" ] && _nt_ntx=$((_nt_ntx + 1))
+    done
+    if [ "${_nt_ntx}" -le 1 ]; then
+        tc qdisc replace dev "${_nt_dev}" root "${_nt_q}" >/dev/null 2>&1
+        return $?
+    fi
+    set -- $(tc qdisc show dev "${_nt_dev}" root 2>/dev/null | head -n 1)
+    _nt_kind="${2:-}"; _nt_h="${3:-0:}"; _nt_h="${_nt_h%%:*}"
+    if [ "${_nt_kind}" != "mq" ] || [ -z "${_nt_h}" ] || [ "${_nt_h}" = "0" ]; then
+        tc qdisc replace dev "${_nt_dev}" root handle 1: mq >/dev/null 2>&1 || return 1
+        _nt_h=1
+    fi
+    _nt_i=1; _nt_rc=0
+    while [ "${_nt_i}" -le "${_nt_ntx}" ]; do
+        tc qdisc replace dev "${_nt_dev}" parent "${_nt_h}:$(printf "%x" "${_nt_i}")" "${_nt_q}" >/dev/null 2>&1 || _nt_rc=1
+        _nt_i=$((_nt_i + 1))
+    done
+    return "${_nt_rc}"
+}
+'
+eval "$NT_QDISC_FN"
+
 apply_live_qdisc() {
     local qdisc="$1"
-    if [ -n "$PRIMARY_NIC" ] && command -v tc >/dev/null 2>&1; then
-        tc qdisc replace dev "$PRIMARY_NIC" root "$qdisc" >/dev/null 2>&1 || true
+    if [ -n "$PRIMARY_NIC" ]; then
+        nt_set_qdisc "$PRIMARY_NIC" "$qdisc" || true
     fi
+}
+
+# 回滚时让内核按 default_qdisc 重新挂载默认队列 (多队列网卡会自动恢复 mq 结构)
+reset_live_qdisc() {
+    if [ -n "$PRIMARY_NIC" ] && command -v tc >/dev/null 2>&1; then
+        tc qdisc del dev "$PRIMARY_NIC" root >/dev/null 2>&1 || true
+    fi
+}
+
+# 网卡 TX / RX 队列数量
+nic_queue_count() {
+    local dir="$1"   # tx | rx
+    local n=0 q
+    [ -n "$PRIMARY_NIC" ] || { printf '0'; return; }
+    for q in /sys/class/net/"${PRIMARY_NIC}"/queues/"${dir}"-*; do
+        [ -d "$q" ] && n=$(( n + 1 ))
+    done
+    printf '%s' "$n"
 }
 
 # ============================= BDP 与内存自适应算参 ===========================
@@ -501,7 +666,6 @@ CALC_DEF_WMEM=262144
 CALC_UDP_MIN=16384
 CALC_BACKLOG=16384
 CALC_BUDGET=600
-CALC_BUDGET_USECS=8000
 CALC_TCP_MEM=""
 CALC_UDP_MEM=""
 
@@ -574,27 +738,136 @@ calculate_buffers() {
 
     CALC_MAX_BUF="$target_buf"
 
-    # 计算全局 TCP / UDP 协议栈内存水位 (单位: 内存页 PAGE_SIZE，兼容 4K 与 ARM64 64K 页)
-    local total_pages=$(( ram_bytes / PAGE_SIZE ))
-    local low_pages=$(( total_pages * 20 / 100 ))
-    local pressure_pages=$(( total_pages * 35 / 100 ))
-    local high_pages=$(( total_pages * 50 / 100 ))
-    [ "$low_pages" -lt 4096 ] && low_pages=4096
-    [ "$pressure_pages" -lt 8192 ] && pressure_pages=8192
-    [ "$high_pages" -lt 16384 ] && high_pages=16384
+    # 计算全局 TCP / UDP 协议栈内存水位。
+    # 这是高并发下真正防 OOM 的总闸：单连接上限再小，连接数一多也会把内存吃光。
+    #   TCP: 物理内存的 6% / 12% / 20% (内核默认约 4.6% / 6.25% / 9.4%)
+    #   UDP: 物理内存的 4% / 8%  / 12%
+    # 512 MiB 以上机型两者合计硬上限不超过物理内存的 32%。保底值按字节计算后再换算成页数，
+    # 兼容 4K 页与 ARM64 64K 页 (旧算法的 16384 页保底在 64K 页机器上会达到 1 GiB)。
+    CALC_TCP_MEM="$(calc_mem_triplet "$ram_bytes" 6 12 20)"
+    CALC_UDP_MEM="$(calc_mem_triplet "$ram_bytes" 4 8 12)"
+}
 
-    CALC_TCP_MEM="${low_pages} ${pressure_pages} ${high_pages}"
-    CALC_UDP_MEM="${low_pages} ${pressure_pages} ${high_pages}"
+# 输出 "low pressure high" 三元组 (单位: 页)
+calc_mem_triplet() {
+    local ram_bytes="$1" p_low="$2" p_press="$3" p_high="$4"
+    local min_low=$(( 16 * 1048576 ))     # 16 MiB
+    local min_press=$(( 24 * 1048576 ))   # 24 MiB
+    local min_high=$(( 32 * 1048576 ))    # 32 MiB
+    local low=$(( ram_bytes * p_low / 100 ))
+    local press=$(( ram_bytes * p_press / 100 ))
+    local high=$(( ram_bytes * p_high / 100 ))
+    [ "$low" -lt "$min_low" ] && low="$min_low"
+    [ "$press" -lt "$min_press" ] && press="$min_press"
+    [ "$high" -lt "$min_high" ] && high="$min_high"
+    # 保底值不得超过物理内存的 1/4 (极小内存机器)
+    local quarter=$(( ram_bytes / 4 ))
+    [ "$high" -gt "$quarter" ] && high="$quarter"
+    [ "$press" -gt "$high" ] && press="$high"
+    [ "$low" -gt "$press" ] && low="$press"
+    printf '%s %s %s' "$(( low / PAGE_SIZE ))" "$(( press / PAGE_SIZE ))" "$(( high / PAGE_SIZE ))"
+}
+
+# 将 "low pressure high" 页数三元组转换为 MiB 便于展示
+mem_triplet_mib() {
+    local triplet="$1"
+    local a b c
+    read -r a b c <<< "$triplet"
+    if printf '%s' "${a:-x}${b:-x}${c:-x}" | grep -qE '^[0-9]+$'; then
+        printf '%s / %s / %s MiB' "$(( a * PAGE_SIZE / 1048576 ))" "$(( b * PAGE_SIZE / 1048576 ))" "$(( c * PAGE_SIZE / 1048576 ))"
+    else
+        printf '%s' "$triplet"
+    fi
 }
 
 # 安全写入 sysctl 键值（自动忽略当前内核不支持或容器只读的键，杜绝 sysctl 报错）
+# 本次写入的 "键=期望值" 列表，供写入后逐项校验
+WRITTEN_KEYS=()
+
 append_sysctl_if_supported() {
     local file="$1"
     local key="$2"
     local val="$3"
     if sysctl_writable "$key"; then
+        snapshot_key "$key"
         printf '%-48s = %s\n' "$key" "$val" >> "$file"
+        WRITTEN_KEYS+=("${key}=${val}")
     fi
+}
+
+# 容量类参数「只升不降」写入 (系统原值更大时保留原值)
+append_sysctl_raise() {
+    local file="$1"
+    local key="$2"
+    local val="$3"
+    sysctl_writable "$key" || return 0
+    snapshot_key "$key"
+    append_sysctl_if_supported "$file" "$key" "$(raise_value "$key" "$val")"
+}
+
+# 运行时直接写入单个参数 (同样先记入快照，容量类可选只升不降)
+sysctl_set_live() {
+    local key="$1"
+    local val="$2"
+    local mode="${3:-exact}"   # exact | raise
+    sysctl_writable "$key" || return 0
+    snapshot_key "$key"
+    [ "$mode" = "raise" ] && val="$(raise_value "$key" "$val")"
+    sysctl -w "${key}=${val}" >/dev/null 2>&1 || true
+}
+
+# 校验本次写入的参数是否真正生效，并检查是否被其它 sysctl 配置文件在开机时覆盖
+verify_written_sysctl() {
+    local own_file="$1"
+    local total="${#WRITTEN_KEYS[@]}"
+    [ "$total" -eq 0 ] && return 0
+
+    local -a failed=() conflicts=()
+    local item key want got
+    for item in "${WRITTEN_KEYS[@]}"; do
+        key="${item%%=*}"
+        want="$(printf '%s' "${item#*=}" | tr -s ' \t' ' ')"
+        got="$(read_sysctl "$key")"
+        [ "$got" != "$want" ] && failed+=("${key} (期望 ${want}，实际 ${got})")
+    done
+
+    # 开机时 sysctl.d 按文件名排序加载，/etc/sysctl.conf 最后加载：排在本脚本文件之后的同名键会覆盖本脚本
+    local own_base="${own_file##*/}" f base
+    local -a later_files=()
+    for f in /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf /lib/sysctl.d/*.conf; do
+        [ -f "$f" ] || continue
+        base="${f##*/}"
+        case "$base" in *net-tune*) continue ;; esac
+        [[ "$base" > "$own_base" ]] && later_files+=("$f")
+    done
+    [ -f /etc/sysctl.conf ] && later_files+=("/etc/sysctl.conf")
+    if [ "${#later_files[@]}" -gt 0 ]; then
+        for item in "${WRITTEN_KEYS[@]}"; do
+            key="${item%%=*}"
+            for f in "${later_files[@]}"; do
+                if grep -qE "^[[:space:]]*-?${key//./[./]}[[:space:]]*=" "$f" 2>/dev/null; then
+                    conflicts+=("${key}  ←  ${f}")
+                fi
+            done
+        done
+    fi
+
+    local ok=$(( total - ${#failed[@]} ))
+    if [ "${#failed[@]}" -eq 0 ]; then
+        printf '  %s 参数校验: %s/%s 项已生效\n' "$(mark_ok)" "$ok" "$total"
+    else
+        printf '  %s 参数校验: %s/%s 项已生效，以下参数未生效 (内核限制或被其它程序改写):\n' "$(mark_warn)" "$ok" "$total"
+        for item in "${failed[@]}"; do
+            printf '      %s- %s%s\n' "${C_YELLOW}" "$item" "${C_RESET}"
+        done
+    fi
+    if [ "${#conflicts[@]}" -gt 0 ]; then
+        printf '  %s 以下参数在开机时会被其它配置文件覆盖，建议删除对应行:\n' "$(mark_warn)"
+        for item in "${conflicts[@]}"; do
+            printf '      %s- %s%s\n' "${C_YELLOW}" "$item" "${C_RESET}"
+        done
+    fi
+    WRITTEN_KEYS=()
 }
 
 # ============================= 核心协议栈调优写入 =============================
@@ -621,18 +894,9 @@ apply_network_profile() {
         cc="$(read_sysctl net.ipv4.tcp_congestion_control)"
     fi
 
-    local qdisc="$req_qdisc"
-    if [ -z "$qdisc" ]; then
-        if [ "$profile" = "udp" ]; then
-            if ensure_qdisc_available "cake" 0; then
-                qdisc="cake"
-            else
-                qdisc="fq"
-            fi
-        else
-            qdisc="fq"
-        fi
-    fi
+    # 默认统一使用 fq：开销低、支持 BBR 节拍与 EDT (SO_TXTIME)，QUIC 协议栈也能直接受益；
+    # cake 在未配置带宽时吞吐受限且 CPU 开销更高，需要时可通过 --qdisc cake 显式指定
+    local qdisc="${req_qdisc:-fq}"
 
     if ! ensure_qdisc_available "$qdisc" 1; then
         log_warn "当前内核不支持队列算法 '${qdisc}'，自动回退至 'fq'。"
@@ -643,8 +907,10 @@ apply_network_profile() {
         fi
     fi
 
-    local extra_mods=("sch_${qdisc}")
+    local -a extra_mods=("sch_${qdisc}")
+    [ "$cc" = "bbr" ] && extra_mods+=("tcp_bbr")
     persist_kernel_modules "${extra_mods[@]}"
+    WRITTEN_KEYS=()
 
     mkdir -p /etc/sysctl.d "$STATE_DIR"
     cat > "$SYSCTL_MAIN" <<EOF
@@ -668,7 +934,7 @@ EOF
     append_sysctl_if_supported "$SYSCTL_MAIN" "net.core.wmem_max" "$CALC_MAX_BUF"
     append_sysctl_if_supported "$SYSCTL_MAIN" "net.core.rmem_default" "$CALC_DEF_RMEM"
     append_sysctl_if_supported "$SYSCTL_MAIN" "net.core.wmem_default" "$CALC_DEF_WMEM"
-    append_sysctl_if_supported "$SYSCTL_MAIN" "net.core.optmem_max" "262144"
+    append_sysctl_raise "$SYSCTL_MAIN" "net.core.optmem_max" "262144"
     append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_rmem" "4096 87380 ${CALC_MAX_BUF}"
     append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_wmem" "4096 65536 ${CALC_MAX_BUF}"
     append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_mem" "$CALC_TCP_MEM"
@@ -679,12 +945,12 @@ EOF
 
     # 3. 队列深度与高并发连接池
     printf '# --- 3. 协议栈队列与本地端口池 ---\n' >> "$SYSCTL_MAIN"
-    append_sysctl_if_supported "$SYSCTL_MAIN" "net.core.somaxconn" "65535"
-    append_sysctl_if_supported "$SYSCTL_MAIN" "net.core.netdev_max_backlog" "$CALC_BACKLOG"
-    append_sysctl_if_supported "$SYSCTL_MAIN" "net.core.netdev_budget" "$CALC_BUDGET"
-    append_sysctl_if_supported "$SYSCTL_MAIN" "net.core.netdev_budget_usecs" "$CALC_BUDGET_USECS"
-    append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_max_syn_backlog" "32768"
-    append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_max_tw_buckets" "262144"
+    # 容量类参数只升不降；netdev_budget_usecs 保持内核默认 (2ms)，避免单次软中断占用过久引发延迟抖动
+    append_sysctl_raise "$SYSCTL_MAIN" "net.core.somaxconn" "65535"
+    append_sysctl_raise "$SYSCTL_MAIN" "net.core.netdev_max_backlog" "$CALC_BACKLOG"
+    append_sysctl_raise "$SYSCTL_MAIN" "net.core.netdev_budget" "$CALC_BUDGET"
+    append_sysctl_raise "$SYSCTL_MAIN" "net.ipv4.tcp_max_syn_backlog" "32768"
+    append_sysctl_raise "$SYSCTL_MAIN" "net.ipv4.tcp_max_tw_buckets" "262144"
     append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.ip_local_port_range" "10240 65535"
     printf '\n' >> "$SYSCTL_MAIN"
 
@@ -698,21 +964,23 @@ EOF
     append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_keepalive_time" "600"
     append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_keepalive_intvl" "30"
     append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_keepalive_probes" "5"
-    append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_syn_retries" "3"
+    # tcp_syn_retries 保持内核默认 (6)：跨境高丢包链路上过少的 SYN 重试会导致建连失败
     append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_synack_retries" "3"
     append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_retries2" "8"
     append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_sack" "1"
     append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_dsack" "1"
     append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_window_scaling" "1"
     append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_timestamps" "1"
-    append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_ecn" "0"
+    # ecn=2：不主动发起 ECN，但接受对端发起的协商 (内核默认)；0 会连对端请求一并拒绝
+    append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_ecn" "2"
     append_sysctl_if_supported "$SYSCTL_MAIN" "net.ipv4.tcp_notsent_lowat" "131072"
     printf '\n' >> "$SYSCTL_MAIN"
 
     # 5. 内核级文件描述符上限
     printf '# --- 5. 内核文件句柄上限 ---\n' >> "$SYSCTL_MAIN"
-    append_sysctl_if_supported "$SYSCTL_MAIN" "fs.file-max" "$TARGET_NOFILE"
-    append_sysctl_if_supported "$SYSCTL_MAIN" "fs.nr_open" "$TARGET_NOFILE"
+    # 只升不降：systemd 240+ 默认 fs.nr_open=1073741816、fs.file-max=LONG_MAX，不应被调低
+    append_sysctl_raise "$SYSCTL_MAIN" "fs.file-max" "$TARGET_NOFILE"
+    append_sysctl_raise "$SYSCTL_MAIN" "fs.nr_open" "$TARGET_NOFILE"
     printf '\n' >> "$SYSCTL_MAIN"
 
     # 6. 若当前系统已启用 nf_conntrack，自动按内存扩容防丢包（未启用则不强行加载以免增加额外开销）
@@ -723,6 +991,7 @@ EOF
     # 立即应用配置并切换实时网卡 qdisc
     sysctl -e -p "$SYSCTL_MAIN" >/dev/null 2>&1 || true
     apply_live_qdisc "$qdisc"
+    verify_written_sysctl "$SYSCTL_MAIN"
 
     # 记录状态供启动脚本及状态栏展示
     cat > "$STATE_FILE" <<EOF
@@ -758,7 +1027,7 @@ append_conntrack_sysctl() {
     local hash_sz=$(( ct_max / 4 ))
 
     printf '# --- Conntrack 连接跟踪表优化 ---\n' >> "$target_file"
-    append_sysctl_if_supported "$target_file" "net.netfilter.nf_conntrack_max" "$ct_max"
+    append_sysctl_raise "$target_file" "net.netfilter.nf_conntrack_max" "$ct_max"
     append_sysctl_if_supported "$target_file" "net.netfilter.nf_conntrack_tcp_timeout_established" "7200"
     append_sysctl_if_supported "$target_file" "net.netfilter.nf_conntrack_tcp_timeout_time_wait" "30"
     append_sysctl_if_supported "$target_file" "net.netfilter.nf_conntrack_tcp_timeout_close_wait" "15"
@@ -790,12 +1059,14 @@ tune_conntrack_explicit() {
 
     persist_kernel_modules "nf_conntrack"
 
-    local ct_file="/etc/sysctl.d/98-net-tune-conntrack.conf"
+    local ct_file="$SYSCTL_CONNTRACK"
     cat > "$ct_file" <<EOF
 # Managed by net-tune.sh — Conntrack Explicit Tuning
 EOF
+    WRITTEN_KEYS=()
     append_conntrack_sysctl "$ct_file"
     sysctl -e -p "$ct_file" >/dev/null 2>&1 || true
+    verify_written_sysctl "$ct_file"
 
     local ct_max
     ct_max="$(read_sysctl net.netfilter.nf_conntrack_max)"
@@ -808,8 +1079,8 @@ apply_ulimit_tuning() {
     ensure_initial_backup
 
     # 1. 内核级上限确保写入
-    sysctl -w "fs.file-max=${TARGET_NOFILE}" >/dev/null 2>&1 || true
-    sysctl -w "fs.nr_open=${TARGET_NOFILE}" >/dev/null 2>&1 || true
+    sysctl_set_live "fs.file-max" "$TARGET_NOFILE" raise
+    sysctl_set_live "fs.nr_open" "$TARGET_NOFILE" raise
 
     # 2. PAM / limits.d
     mkdir -p /etc/security/limits.d
@@ -819,8 +1090,6 @@ apply_ulimit_tuning() {
 *               hard    nofile          ${TARGET_NOFILE}
 root            soft    nofile          ${TARGET_NOFILE}
 root            hard    nofile          ${TARGET_NOFILE}
-*               soft    nproc           unlimited
-*               hard    nproc           unlimited
 EOF
 
     # 3. Systemd 与 OpenRC 差异化适配
@@ -858,35 +1127,43 @@ EOF
     log_ok "全局文件句柄上限已调优至 ${TARGET_NOFILE} (兼容 ${INIT_SYSTEM} 服务与交互会话)"
 }
 
-# 生成任意核心数的标准 Linux 十六进制 CPU 位图 (支持 >64 核无溢出)
+# 生成在线 CPU 的标准 Linux 十六进制位图 (逗号分隔的 32 位分组，支持 >64 核与非连续 CPU 编号)
+# 优先读取 /sys/devices/system/cpu/online (如 "0-3,6-7")，避免离线 CPU 被写入 RPS 掩码
 generate_cpu_bitmask() {
-    local cores="$1"
-    local rem="$cores"
-    local mask=""
-    while [ "$rem" -gt 32 ]; do
-        if [ -z "$mask" ]; then
-            mask="ffffffff"
-        else
-            mask="ffffffff,${mask}"
-        fi
-        rem=$(( rem - 32 ))
+    local list=""
+    [ -r /sys/devices/system/cpu/online ] && list="$(cat /sys/devices/system/cpu/online 2>/dev/null)"
+    printf '%s' "$list" | grep -qE '^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$' || list="0-$(( CPU_CORES - 1 ))"
+
+    local -a words=() parts=()
+    local part a b i w max_w=0
+    IFS=, read -ra parts <<< "$list"
+    for part in "${parts[@]}"; do
+        case "$part" in
+            *-*) a="${part%-*}"; b="${part#*-}" ;;
+            *)   a="$part"; b="$part" ;;
+        esac
+        for (( i = a; i <= b; i++ )); do
+            w=$(( i / 32 ))
+            words[w]=$(( ${words[w]:-0} | (1 << (i % 32)) ))
+            [ "$w" -gt "$max_w" ] && max_w="$w"
+        done
     done
-    if [ "$rem" -gt 0 ]; then
-        local top_val=0
-        if [ "$rem" -eq 32 ]; then
-            top_val=4294967295
+
+    local out=""
+    for (( w = max_w; w >= 0; w-- )); do
+        if [ -z "$out" ]; then
+            out="$(printf '%x' "${words[w]:-0}")"
         else
-            top_val=$(( (1 << rem) - 1 ))
+            out="${out},$(printf '%08x' "${words[w]:-0}")"
         fi
-        local top_hex
-        top_hex="$(printf '%x' "$top_val")"
-        if [ -z "$mask" ]; then
-            mask="$top_hex"
-        else
-            mask="${top_hex},${mask}"
-        fi
-    fi
-    printf '%s' "${mask:-1}"
+    done
+    printf '%s' "${out:-1}"
+}
+
+# RPS 仅在「RX 硬件队列数 < CPU 核数」时才有收益；队列数已覆盖所有核心时开启只会增加跨核开销
+rps_recommended() {
+    local rx_count="$1"
+    [ "$CPU_CORES" -gt 1 ] && [ "$rx_count" -gt 0 ] && [ "$rx_count" -lt "$CPU_CORES" ]
 }
 
 apply_nic_tuning() {
@@ -897,13 +1174,17 @@ apply_nic_tuning() {
         log_warn "未检测到有效主网卡，跳过网卡队列优化。"
         return 0
     fi
+    ensure_initial_backup
 
     local cur_qdisc
     cur_qdisc="$(read_sysctl net.core.default_qdisc)"
     [ "$cur_qdisc" = "N/A" ] && cur_qdisc="fq"
 
-    local cpu_mask
-    cpu_mask="$(generate_cpu_bitmask "$CPU_CORES")"
+    local cpu_mask rx_count tx_count enable_rps=0
+    cpu_mask="$(generate_cpu_bitmask)"
+    rx_count="$(nic_queue_count rx)"
+    tx_count="$(nic_queue_count tx)"
+    rps_recommended "$rx_count" && enable_rps=1
 
     local hash_sz=""
     if [ -e /sys/module/nf_conntrack/parameters/hashsize ]; then
@@ -913,42 +1194,50 @@ apply_nic_tuning() {
     fi
 
     mkdir -p "$STATE_DIR"
-    cat > "$NIC_SCRIPT" <<EOF
+    {
+        cat <<EOF
 #!/bin/sh
 # Managed by net-tune.sh — Boot-time NIC & Runtime Queue Optimizer
 NIC="${PRIMARY_NIC}"
 QDISC="${cur_qdisc}"
-CORES="${CPU_CORES}"
+ENABLE_RPS="${enable_rps}"
 CPU_MASK="${cpu_mask}"
 CT_HASHSIZE="${hash_sz}"
+EOF
+        printf '%s\n' "$NT_QDISC_FN"
+        cat <<'EOF'
+if [ -d "/sys/class/net/${NIC}" ]; then
+    command -v ip >/dev/null 2>&1 && ip link set dev "${NIC}" txqueuelen 10000 2>/dev/null || true
+    nt_set_qdisc "${NIC}" "${QDISC}" || true
 
-if [ -d "/sys/class/net/\${NIC}" ]; then
-    command -v ip >/dev/null 2>&1 && ip link set dev "\${NIC}" txqueuelen 10000 2>/dev/null || true
-    command -v tc >/dev/null 2>&1 && tc qdisc replace dev "\${NIC}" root "\${QDISC}" 2>/dev/null || true
-
-    if [ "\${CORES}" -gt 1 ] && [ -d "/sys/class/net/\${NIC}/queues" ]; then
-        rx_count=0
-        for q in /sys/class/net/"\${NIC}"/queues/rx-*; do
-            [ -d "\$q" ] && rx_count=\$(( rx_count + 1 ))
+    rx_count=0
+    for q in /sys/class/net/"${NIC}"/queues/rx-*; do
+        [ -d "$q" ] && rx_count=$(( rx_count + 1 ))
+    done
+    if [ "${ENABLE_RPS}" = "1" ] && [ "${rx_count}" -gt 0 ]; then
+        total_flows=32768
+        per_q=$(( total_flows / rx_count ))
+        [ -w /proc/sys/net/core/rps_sock_flow_entries ] && echo "${total_flows}" > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+        for q in /sys/class/net/"${NIC}"/queues/rx-*; do
+            [ -w "$q/rps_cpus" ] && echo "${CPU_MASK}" > "$q/rps_cpus" 2>/dev/null || true
+            [ -w "$q/rps_flow_cnt" ] && echo "${per_q}" > "$q/rps_flow_cnt" 2>/dev/null || true
         done
-        if [ "\${rx_count}" -gt 0 ]; then
-            total_flows=32768
-            per_q=\$(( total_flows / rx_count ))
-            [ -w /proc/sys/net/core/rps_sock_flow_entries ] && echo "\${total_flows}" > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
-            for q in /sys/class/net/"\${NIC}"/queues/rx-*; do
-                [ -w "\$q/rps_cpus" ] && echo "\${CPU_MASK}" > "\$q/rps_cpus" 2>/dev/null || true
-                [ -w "\$q/rps_flow_cnt" ] && echo "\${per_q}" > "\$q/rps_flow_cnt" 2>/dev/null || true
-            done
-        fi
     fi
 fi
 
-if [ -n "\${CT_HASHSIZE}" ] && [ -w /sys/module/nf_conntrack/parameters/hashsize ]; then
-    echo "\${CT_HASHSIZE}" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
+if [ -n "${CT_HASHSIZE}" ] && [ -w /sys/module/nf_conntrack/parameters/hashsize ]; then
+    echo "${CT_HASHSIZE}" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
 fi
 exit 0
 EOF
+    } > "$NIC_SCRIPT"
     chmod 0755 "$NIC_SCRIPT"
+    snapshot_key net.core.rps_sock_flow_entries
+
+    # 从 RPS 开启切换为不推荐时 (如网卡队列数变化)，先清理旧的 RPS 设置
+    if [ "$enable_rps" -eq 0 ]; then
+        clear_rps_settings
+    fi
     "$NIC_SCRIPT"
 
     # 注册开机自启以保持 txqueuelen / tc qdisc / RPS 在重启后持续生效
@@ -976,11 +1265,39 @@ EOF
         rc-update add local default >/dev/null 2>&1 || true
     fi
 
-    if [ "$CPU_CORES" -gt 1 ]; then
-        log_ok "主网卡 (${PRIMARY_NIC}) 已优化: txqueuelen=10000, qdisc=${cur_qdisc}, 多核 RPS/RFS (掩码 0x${cpu_mask}) 已激活"
+    local queue_desc="单队列"
+    [ "$tx_count" -gt 1 ] && queue_desc="多队列 mq × ${tx_count}"
+    if [ "$enable_rps" -eq 1 ]; then
+        log_ok "主网卡 (${PRIMARY_NIC}) 已优化: txqueuelen=10000, ${queue_desc} + ${cur_qdisc}, RPS/RFS 已激活 (RX 队列 ${rx_count} < ${CPU_CORES} 核, 掩码 ${cpu_mask})"
+    elif [ "$CPU_CORES" -le 1 ]; then
+        log_ok "主网卡 (${PRIMARY_NIC}) 已优化: txqueuelen=10000, ${queue_desc} + ${cur_qdisc} (单核环境无需 RPS)"
     else
-        log_ok "主网卡 (${PRIMARY_NIC}) 已优化: txqueuelen=10000, qdisc=${cur_qdisc} (单核环境自动跳过 RPS)"
+        log_ok "主网卡 (${PRIMARY_NIC}) 已优化: txqueuelen=10000, ${queue_desc} + ${cur_qdisc} (RX 队列 ${rx_count} 已覆盖 ${CPU_CORES} 核，无需 RPS)"
     fi
+}
+
+clear_rps_settings() {
+    [ -n "$PRIMARY_NIC" ] && [ -d "/sys/class/net/${PRIMARY_NIC}/queues" ] || return 0
+    local q
+    for q in /sys/class/net/"${PRIMARY_NIC}"/queues/rx-*; do
+        [ -w "$q/rps_cpus" ] && printf '0' > "$q/rps_cpus" 2>/dev/null || true
+        [ -w "$q/rps_flow_cnt" ] && printf '0' > "$q/rps_flow_cnt" 2>/dev/null || true
+    done
+    [ -w /proc/sys/net/core/rps_sock_flow_entries ] && printf '0' > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+}
+
+# RPS 当前状态 (用于仪表盘)
+get_rps_status() {
+    local q val
+    for q in /sys/class/net/"${PRIMARY_NIC}"/queues/rx-*; do
+        [ -r "$q/rps_cpus" ] || continue
+        val="$(tr -d ',0\n' < "$q/rps_cpus" 2>/dev/null)"
+        if [ -n "$val" ]; then
+            printf '已启用'
+            return
+        fi
+    done
+    printf '未启用'
 }
 
 # ============================= 周边辅助工具集 =================================
@@ -1046,10 +1363,12 @@ set_ip_forward() {
     cat > "$SYSCTL_FORWARD" <<EOF
 # Managed by net-tune.sh — IPv4 / IPv6 Forwarding
 EOF
+    WRITTEN_KEYS=()
     append_sysctl_if_supported "$SYSCTL_FORWARD" "net.ipv4.ip_forward" "$enable"
     append_sysctl_if_supported "$SYSCTL_FORWARD" "net.ipv6.conf.all.forwarding" "$enable"
     append_sysctl_if_supported "$SYSCTL_FORWARD" "net.ipv6.conf.default.forwarding" "$enable"
     sysctl -e -p "$SYSCTL_FORWARD" >/dev/null 2>&1 || true
+    verify_written_sysctl "$SYSCTL_FORWARD"
 
     if [ "$enable" = "1" ]; then
         log_ok "已开启 IPv4 & IPv6 内核流量转发 (ip_forward = 1)"
@@ -1191,7 +1510,7 @@ rollback_all() {
         "$SYSCTL_MAIN" \
         "$SYSCTL_FORWARD" \
         "$SYSCTL_SWAP" \
-        "/etc/sysctl.d/98-net-tune-conntrack.conf" \
+        "$SYSCTL_CONNTRACK" \
         "$MODULES_CONF" \
         "$MODPROBE_CONF" \
         "$LIMITS_CONF" \
@@ -1217,7 +1536,8 @@ rollback_all() {
         cp -a "${BACKUP_FILES_DIR}/rc.conf.orig" /etc/rc.conf
     fi
 
-    # 3. 恢复初始 sysctl 快照值，并重新加载系统原厂 sysctl
+    # 3. 清理 RPS，恢复初始 sysctl 快照值，并重新加载系统原厂 sysctl
+    clear_rps_settings
     if [ -f "$SYSCTL_SNAPSHOT" ]; then
         while IFS='=' read -r key val; do
             [ -z "$key" ] && continue
@@ -1226,26 +1546,37 @@ rollback_all() {
     fi
     reload_all_sysctl
 
-    # 4. 恢复主网卡默认 qdisc、发送队列长度与 RPS 状态
-    local def_qdisc
-    def_qdisc="$(read_sysctl net.core.default_qdisc)"
-    [ "$def_qdisc" != "N/A" ] && apply_live_qdisc "$def_qdisc"
+    # 4. 让内核按恢复后的 default_qdisc 重新挂载默认队列 (多队列网卡自动恢复 mq)，并还原发送队列长度
+    reset_live_qdisc
     if [ -n "$PRIMARY_NIC" ] && [ -d "/sys/class/net/${PRIMARY_NIC}" ]; then
         command -v ip >/dev/null 2>&1 && ip link set dev "$PRIMARY_NIC" txqueuelen 1000 2>/dev/null || true
-        if [ -d "/sys/class/net/${PRIMARY_NIC}/queues" ]; then
-            local q
-            for q in /sys/class/net/"${PRIMARY_NIC}"/queues/rx-*; do
-                [ -w "$q/rps_cpus" ] && printf '0' > "$q/rps_cpus" 2>/dev/null || true
-                [ -w "$q/rps_flow_cnt" ] && printf '0' > "$q/rps_flow_cnt" 2>/dev/null || true
-            done
-        fi
     fi
-    [ -w /proc/sys/net/core/rps_sock_flow_entries ] && printf '0' > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
 
     log_ok "所有网络调优项已回滚至初始状态（如修改过服务句柄上限，重启机器或重启对应服务后彻底还原）。"
 }
 
 # ============================= 状态仪表盘与体检 ===============================
+# 网卡实时队列。设置 LIVE_QDISC_LEAF (实际处理流量的叶子队列) 与 LIVE_QDISC_DESC (展示文本)
+LIVE_QDISC_LEAF=""
+LIVE_QDISC_DESC="N/A"
+probe_live_qdisc() {
+    LIVE_QDISC_LEAF=""
+    LIVE_QDISC_DESC="N/A"
+    [ -n "$PRIMARY_NIC" ] && command -v tc >/dev/null 2>&1 || return 0
+    local root_kind child_kind ntx
+    root_kind="$(tc qdisc show dev "$PRIMARY_NIC" root 2>/dev/null | awk 'NR==1 {print $2}')"
+    [ -z "$root_kind" ] && return 0
+    if [ "$root_kind" = "mq" ] || [ "$root_kind" = "mqprio" ]; then
+        child_kind="$(tc qdisc show dev "$PRIMARY_NIC" 2>/dev/null | awk '$0 ~ / parent / {print $2; exit}')"
+        ntx="$(nic_queue_count tx)"
+        LIVE_QDISC_LEAF="${child_kind:-$root_kind}"
+        LIVE_QDISC_DESC="${root_kind} × ${ntx} (${child_kind:-?})"
+    else
+        LIVE_QDISC_LEAF="$root_kind"
+        LIVE_QDISC_DESC="$root_kind"
+    fi
+}
+
 get_swap_summary() {
     if [ -r /proc/meminfo ]; then
         local total_kb free_kb used_mb total_mb
@@ -1263,37 +1594,115 @@ get_swap_summary() {
     fi
 }
 
+# Conntrack 使用率 (百分比，未加载时为空)
+conntrack_usage_pct() {
+    [ -r /proc/sys/net/netfilter/nf_conntrack_max ] || return 0
+    local cur max
+    cur="$(read_sysctl net.netfilter.nf_conntrack_count)"
+    max="$(read_sysctl net.netfilter.nf_conntrack_max)"
+    if printf '%s%s' "$cur" "$max" | grep -qE '^[0-9]+$' && [ "$max" -gt 0 ]; then
+        printf '%s' "$(( cur * 100 / max ))"
+    fi
+}
+
 get_conntrack_summary() {
     if [ -r /proc/sys/net/netfilter/nf_conntrack_max ]; then
-        local cur max
+        local cur max pct
         cur="$(read_sysctl net.netfilter.nf_conntrack_count)"
         max="$(read_sysctl net.netfilter.nf_conntrack_max)"
-        printf '%s / %s' "$cur" "$max"
+        pct="$(conntrack_usage_pct)"
+        if [ -n "$pct" ] && [ "$pct" -ge 80 ]; then
+            printf '%s / %s (%s%s%%%s) %s' "$cur" "$max" "${C_RED}" "$pct" "${C_RESET}" "$(mark_bad)"
+        else
+            printf '%s / %s (%s%%)' "$cur" "$max" "${pct:-0}"
+        fi
     else
         printf '未加载 (无状态低开销)'
     fi
 }
 
-get_live_nic_qdisc() {
-    if [ -n "$PRIMARY_NIC" ] && command -v tc >/dev/null 2>&1; then
-        tc qdisc show dev "$PRIMARY_NIC" 2>/dev/null | awk 'NR==1 {print $2}'
+# 从 /proc/net/sockstat 读取协议栈实时占用。设置 SOCK_TCP_INUSE / SOCK_TCP_TW / SOCK_TCP_MEM / SOCK_UDP_MEM (页)
+SOCK_TCP_INUSE="0"; SOCK_TCP_TW="0"; SOCK_TCP_MEM="0"; SOCK_UDP_MEM="0"
+probe_sockstat() {
+    [ -r /proc/net/sockstat ] || return 0
+    local line
+    line="$(awk '/^TCP:/ { for (i = 2; i < NF; i += 2) v[$i] = $(i + 1); print v["inuse"]+0, v["tw"]+0, v["mem"]+0 }' /proc/net/sockstat 2>/dev/null)"
+    read -r SOCK_TCP_INUSE SOCK_TCP_TW SOCK_TCP_MEM <<< "${line:-0 0 0}"
+    SOCK_UDP_MEM="$(awk '/^UDP:/ { for (i = 2; i < NF; i += 2) if ($i == "mem") print $(i + 1)+0 }' /proc/net/sockstat 2>/dev/null)"
+    SOCK_UDP_MEM="${SOCK_UDP_MEM:-0}"
+}
+
+pages_to_mib() {
+    local pages="$1"
+    printf '%s' "$pages" | grep -qE '^[0-9]+$' || { printf '%s' "$pages"; return; }
+    awk -v p="$pages" -v s="$PAGE_SIZE" 'BEGIN { printf "%.1f MiB", p * s / 1048576 }'
+}
+
+fmt_limit() {
+    local v="$1"
+    if printf '%s' "$v" | grep -qE '^[0-9]+$' && [ "${#v}" -ge 18 ]; then
+        printf '不限 (LONG_MAX)'
     else
-        printf 'N/A'
+        printf '%s' "$v"
     fi
+}
+
+# 体检：收集异常与建议到 HEALTH_ITEMS
+HEALTH_ITEMS=()
+collect_health() {
+    HEALTH_ITEMS=()
+    local cc qdisc ulimit_n pct swap_kb tcp_press
+    cc="$(read_sysctl net.ipv4.tcp_congestion_control)"
+    qdisc="$(read_sysctl net.core.default_qdisc)"
+    [ "$cc" != "bbr" ] && HEALTH_ITEMS+=("拥塞控制为 ${cc}，未启用 BBR → 菜单 1 一键调优")
+    case "$qdisc" in
+        fq|cake|fq_pie|fq_codel) ;;
+        *) HEALTH_ITEMS+=("默认队列为 ${qdisc}，建议使用 fq → 菜单 1 或 4") ;;
+    esac
+    if [ -n "$LIVE_QDISC_LEAF" ] && [ "$qdisc" != "N/A" ] && [ "$LIVE_QDISC_LEAF" != "$qdisc" ] \
+        && [ "$LIVE_QDISC_LEAF" != "noqueue" ]; then
+        HEALTH_ITEMS+=("网卡实时队列 (${LIVE_QDISC_LEAF}) 与 default_qdisc (${qdisc}) 不一致 → 菜单 5 重新应用网卡优化")
+    fi
+    ulimit_n="$(ulimit -n 2>/dev/null || echo 0)"
+    if [ "$ulimit_n" != "unlimited" ] && [ "${ulimit_n:-0}" -lt 65535 ] 2>/dev/null; then
+        if [ -f "$LIMITS_CONF" ]; then
+            HEALTH_ITEMS+=("当前会话 ulimit -n=${ulimit_n}，重新登录 SSH / 重启服务后生效")
+        else
+            HEALTH_ITEMS+=("当前会话 ulimit -n=${ulimit_n} 偏低，高并发代理易出现 too many open files → 菜单 5")
+        fi
+    fi
+    pct="$(conntrack_usage_pct)"
+    if [ -n "$pct" ] && [ "$pct" -ge 80 ]; then
+        HEALTH_ITEMS+=("Conntrack 跟踪表使用率 ${pct}%，接近满表丢包 → 菜单 6 扩容")
+    fi
+    tcp_press="$(read_sysctl net.ipv4.tcp_mem | awk '{print $2}')"
+    if printf '%s' "${tcp_press:-x}" | grep -qE '^[0-9]+$' && [ "${SOCK_TCP_MEM:-0}" -ge "$tcp_press" ]; then
+        HEALTH_ITEMS+=("TCP 协议栈内存已超过压力线 ($(pages_to_mib "$SOCK_TCP_MEM") ≥ $(pages_to_mib "$tcp_press"))，内核正在压缩缓冲")
+    fi
+    swap_kb="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    if [ "${swap_kb:-0}" -eq 0 ] && [ "$MEM_TOTAL_MB" -le 1200 ] && [ "$IS_CONTAINER" -eq 0 ]; then
+        HEALTH_ITEMS+=("${MEM_TOTAL_MB} MiB 小内存机器未启用 Swap，高峰期有 OOM 风险 → 菜单 9")
+    fi
+    return 0
+}
+
+param_row() {
+    printf '  %s = %s\n' "$(pad_to "$1" 42)" "$2"
+}
+
+status_mark() {
+    # $1: 1=正常 0=异常
+    if [ "$1" -eq 1 ]; then mark_ok; else mark_warn; fi
 }
 
 show_dashboard() {
     local detailed="${1:-0}"
 
-    local cc qdisc live_qdisc rmem_max wmem_max tcp_rmem tcp_wmem udp_min
-    local tfo slow_idle lowat file_max ulimit_n ip4_fwd ip6_fwd active_prof
+    local cc qdisc rmem_max wmem_max udp_min tfo slow_idle lowat file_max ulimit_n ip4_fwd ip6_fwd
     cc="$(read_sysctl net.ipv4.tcp_congestion_control)"
     qdisc="$(read_sysctl net.core.default_qdisc)"
-    live_qdisc="$(get_live_nic_qdisc)"
     rmem_max="$(read_sysctl net.core.rmem_max)"
     wmem_max="$(read_sysctl net.core.wmem_max)"
-    tcp_rmem="$(read_sysctl net.ipv4.tcp_rmem)"
-    tcp_wmem="$(read_sysctl net.ipv4.tcp_wmem)"
     udp_min="$(read_sysctl net.ipv4.udp_rmem_min)"
     tfo="$(read_sysctl net.ipv4.tcp_fastopen)"
     slow_idle="$(read_sysctl net.ipv4.tcp_slow_start_after_idle)"
@@ -1302,53 +1711,97 @@ show_dashboard() {
     ulimit_n="$(ulimit -n 2>/dev/null || echo N/A)"
     ip4_fwd="$(read_sysctl net.ipv4.ip_forward)"
     ip6_fwd="$(read_sysctl net.ipv6.conf.all.forwarding)"
+    probe_live_qdisc
+    probe_sockstat
+    collect_health
 
-    active_prof="未应用"
+    local badge
     if [ -r "$STATE_FILE" ]; then
+        local ACTIVE_PROFILE="" UPDATED_AT=""
         # shellcheck disable=SC1090
         . "$STATE_FILE"
-        active_prof="${ACTIVE_PROFILE:-已调优} (${UPDATED_AT:-})"
+        badge="${C_GREEN}[已调优: ${ACTIVE_PROFILE:-custom}]${C_RESET}"
+    else
+        badge="${C_YELLOW}[未调优]${C_RESET}"
     fi
 
-    local rmem_h="$rmem_max"
+    local rmem_h="$rmem_max" wmem_h="$wmem_max" lowat_h="$lowat"
     printf '%s' "$rmem_max" | grep -qE '^[0-9]+$' && rmem_h="$(human_bytes "$rmem_max")"
-    local wmem_h="$wmem_max"
     printf '%s' "$wmem_max" | grep -qE '^[0-9]+$' && wmem_h="$(human_bytes "$wmem_max")"
+    if [ "$lowat" = "4294967295" ]; then
+        lowat_h="不限 (内核默认)"
+    elif printf '%s' "$lowat" | grep -qE '^[0-9]+$'; then
+        lowat_h="$(human_bytes "$lowat")"
+    fi
 
-    printf '\n%s======================================================================%s\n' "${C_BLUE}${C_BOLD}" "${C_RESET}"
-    printf ' %sVPS 网络与高并发调优面板 (net-tune v%s)%s\n' "${C_BOLD}" "${SCRIPT_VERSION}" "${C_RESET}"
-    printf '%s======================================================================%s\n' "${C_BLUE}${C_BOLD}" "${C_RESET}"
-    printf ' %-16s : %s (%s / %s)\n' "系统与内核" "${OS_PRETTY}" "${KERNEL_REL}" "${ARCH}"
-    printf ' %-16s : %s | Init: %s | %s 核 / %s MiB 内存\n' "硬件与虚拟化" "${VIRT_TYPE}" "${INIT_SYSTEM}" "${CPU_CORES}" "${MEM_TOTAL_MB}"
-    printf ' %-16s : %s | 实时队列: %s\n' "主出站网卡" "${PRIMARY_NIC:-未检测到}" "${live_qdisc:-N/A}"
-    print_hr
-    printf ' %-16s : %s%s + %s%s\n' "拥塞控制 + 队列" "${C_GREEN}${C_BOLD}" "${cc}" "${qdisc}" "${C_RESET}"
-    printf ' %-16s : 读 %s / 写 %s | UDP min: %s B\n' "最大 Socket 缓冲" "${rmem_h}" "${wmem_h}" "${udp_min}"
-    printf ' %-16s : TFO=%s | 空闲慢启动=%s | notsent_lowat=%s\n' "TCP 传输特性" "${tfo}" "${slow_idle}" "${lowat}"
-    printf ' %-16s : file-max=%s | 当前会话 ulimit -n=%s\n' "文件句柄上限" "${file_max}" "${ulimit_n}"
-    printf ' %-16s : %s\n' "Conntrack 跟踪表" "$(get_conntrack_summary)"
-    printf ' %-16s : IPv4=%s, IPv6=%s | 出站: %s\n' "IP 转发与优先级" "${ip4_fwd}" "${ip6_fwd}" "$(get_ip_preference)"
-    printf ' %-16s : %s\n' "Swap 虚拟内存" "$(get_swap_summary)"
-    printf ' %-16s : %s%s%s\n' "当前调优档案" "${C_CYAN}" "${active_prof}" "${C_RESET}"
-    printf '%s======================================================================%s\n' "${C_BLUE}${C_BOLD}" "${C_RESET}"
+    local tcp_press udp_press
+    tcp_press="$(read_sysctl net.ipv4.tcp_mem | awk '{print $2}')"
+    udp_press="$(read_sysctl net.ipv4.udp_mem | awk '{print $2}')"
+
+    local cc_ok=0 q_ok=0
+    [ "$cc" = "bbr" ] && cc_ok=1
+    case "$qdisc" in fq|cake|fq_pie|fq_codel) q_ok=1 ;; esac
+    [ -n "$LIVE_QDISC_LEAF" ] && [ "$LIVE_QDISC_LEAF" != "$qdisc" ] && [ "$LIVE_QDISC_LEAF" != "noqueue" ] && q_ok=0
+
+    local rps_desc="" rx_count
+    rx_count="$(nic_queue_count rx)"
+    [ -n "$PRIMARY_NIC" ] && [ "$CPU_CORES" -gt 1 ] && rps_desc=" | RPS $(get_rps_status)"
+
+    printf '\n'
+    print_hr2
+    local title=" net-tune v${SCRIPT_VERSION}  VPS 网络与高并发调优面板"
+    printf '%s%s%s%s\n' "${C_BOLD}" "$(pad_to "$title" 52)" "${C_RESET}" "$badge"
+    print_hr2
+
+    section_title "系统"
+    kv_row "系统与内核" "${OS_PRETTY} | ${KERNEL_REL} | ${ARCH}"
+    kv_row "硬件与虚拟化" "${VIRT_TYPE} | ${INIT_SYSTEM} | ${CPU_CORES} 核 | ${MEM_TOTAL_MB} MiB 内存"
+    kv_row "主出站网卡" "${PRIMARY_NIC:-未检测到} | 队列 ${LIVE_QDISC_DESC}${rps_desc}"
+
+    section_title "网络协议栈"
+    kv_row "拥塞控制" "$(status_mark "$cc_ok") ${C_BOLD}${cc}${C_RESET}"
+    kv_row "队列调度" "$(status_mark "$q_ok") ${C_BOLD}${qdisc}${C_RESET} (网卡实时: ${LIVE_QDISC_LEAF:-N/A})"
+    kv_row "Socket 缓冲上限" "读 ${rmem_h} / 写 ${wmem_h} | UDP min ${udp_min} B"
+    kv_row "协议栈内存" "TCP $(pages_to_mib "$SOCK_TCP_MEM") / 压力线 $(pages_to_mib "${tcp_press:-N/A}") | UDP $(pages_to_mib "$SOCK_UDP_MEM") / $(pages_to_mib "${udp_press:-N/A}")"
+    kv_row "TCP 连接" "活跃 ${SOCK_TCP_INUSE} | TIME_WAIT ${SOCK_TCP_TW}"
+    kv_row "TCP 特性" "TFO=${tfo} | 空闲慢启动=${slow_idle} | notsent_lowat=${lowat_h}"
+
+    section_title "系统资源"
+    kv_row "文件句柄" "file-max=$(fmt_limit "$file_max") | 当前会话 ulimit -n=${ulimit_n}"
+    kv_row "Conntrack" "$(get_conntrack_summary)"
+    kv_row "IP 转发" "IPv4=${ip4_fwd} IPv6=${ip6_fwd} | 出站 $(get_ip_preference)"
+    kv_row "Swap" "$(get_swap_summary)"
+    printf '\n'
+
+    if [ "${#HEALTH_ITEMS[@]}" -eq 0 ]; then
+        printf '  %s 体检通过，未发现异常\n' "$(mark_ok)"
+    elif [ "$detailed" -eq 1 ]; then
+        printf '  %s 体检发现 %s 项建议:\n' "$(mark_warn)" "${#HEALTH_ITEMS[@]}"
+        local item
+        for item in "${HEALTH_ITEMS[@]}"; do
+            printf '     %s-%s %s\n' "${C_YELLOW}" "${C_RESET}" "$item"
+        done
+    else
+        printf '  %s 体检发现 %s 项建议 %s(菜单 10 查看详情)%s\n' "$(mark_warn)" "${#HEALTH_ITEMS[@]}" "${C_DIM}" "${C_RESET}"
+    fi
+    print_hr2
 
     if [ "$detailed" -eq 1 ]; then
-        printf '\n%s[核心内核参数明细]%s\n' "${C_BOLD}" "${C_RESET}"
-        printf '  net.ipv4.tcp_available_congestion_control = %s\n' "$(read_sysctl net.ipv4.tcp_available_congestion_control)"
-        printf '  net.ipv4.tcp_rmem                         = %s\n' "$tcp_rmem"
-        printf '  net.ipv4.tcp_wmem                         = %s\n' "$tcp_wmem"
-        printf '  net.ipv4.tcp_mem                          = %s (页大小: %s B)\n' "$(read_sysctl net.ipv4.tcp_mem)" "$PAGE_SIZE"
-        printf '  net.ipv4.udp_mem                          = %s\n' "$(read_sysctl net.ipv4.udp_mem)"
-        printf '  net.core.somaxconn                        = %s\n' "$(read_sysctl net.core.somaxconn)"
-        printf '  net.core.netdev_max_backlog               = %s\n' "$(read_sysctl net.core.netdev_max_backlog)"
-        printf '  net.ipv4.tcp_max_syn_backlog              = %s\n' "$(read_sysctl net.ipv4.tcp_max_syn_backlog)"
-        printf '  net.ipv4.ip_local_port_range              = %s\n' "$(read_sysctl net.ipv4.ip_local_port_range)"
-        printf '  net.ipv4.tcp_mtu_probing                  = %s\n' "$(read_sysctl net.ipv4.tcp_mtu_probing)"
-        printf '  net.ipv4.tcp_tw_reuse                     = %s\n' "$(read_sysctl net.ipv4.tcp_tw_reuse)"
-        printf '  net.ipv4.tcp_fin_timeout                  = %s\n' "$(read_sysctl net.ipv4.tcp_fin_timeout)"
-        printf '  net.ipv4.tcp_ecn                          = %s\n' "$(read_sysctl net.ipv4.tcp_ecn)"
+        printf '\n  %s[核心内核参数明细]%s\n' "${C_BOLD}" "${C_RESET}"
+        local k
+        for k in \
+            net.ipv4.tcp_available_congestion_control \
+            net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_mem net.ipv4.udp_mem \
+            net.core.somaxconn net.core.netdev_max_backlog net.core.netdev_budget \
+            net.ipv4.tcp_max_syn_backlog net.ipv4.tcp_max_tw_buckets net.ipv4.ip_local_port_range \
+            net.ipv4.tcp_mtu_probing net.ipv4.tcp_tw_reuse net.ipv4.tcp_fin_timeout \
+            net.ipv4.tcp_syn_retries net.ipv4.tcp_ecn fs.nr_open; do
+            param_row "$k" "$(read_sysctl "$k")"
+        done
+        param_row "tcp_mem / udp_mem (换算)" "$(mem_triplet_mib "$(read_sysctl net.ipv4.tcp_mem)") | $(mem_triplet_mib "$(read_sysctl net.ipv4.udp_mem)")"
         if [ -n "$PRIMARY_NIC" ] && [ -r "/sys/class/net/${PRIMARY_NIC}/tx_queue_len" ]; then
-            printf '  NIC (%s) tx_queue_len                   = %s\n' "$PRIMARY_NIC" "$(cat "/sys/class/net/${PRIMARY_NIC}/tx_queue_len" 2>/dev/null || echo N/A)"
+            param_row "${PRIMARY_NIC} tx_queue_len" "$(cat "/sys/class/net/${PRIMARY_NIC}/tx_queue_len" 2>/dev/null || echo N/A)"
+            param_row "${PRIMARY_NIC} 硬件队列 (TX / RX)" "$(nic_queue_count tx) / ${rx_count}"
         fi
         printf '\n'
     fi
@@ -1465,46 +1918,114 @@ uninstall_all() {
 }
 
 # ============================= 一键组合执行动作 ===============================
+step_title() {
+    printf '\n%s[%s/%s]%s %s%s%s\n' "${C_CYAN}${C_BOLD}" "$1" "$2" "${C_RESET}" "${C_BOLD}" "$3" "${C_RESET}"
+}
+
+profile_label() {
+    case "$1" in
+        balanced) printf '均衡通用档 (balanced)' ;;
+        bdp)      printf 'BDP 精准计算档 (bdp)' ;;
+        udp)      printf 'UDP / QUIC 强化档 (udp)' ;;
+        *)        printf '%s' "$1" ;;
+    esac
+}
+
 run_full_tune() {
     local profile="$1"
     local qdisc="${2:-}"
     local bw="${3:-1000}"
     local rtt="${4:-150}"
 
-    apply_network_profile "$profile" "$qdisc" "$bw" "$rtt"
+    step_title 1 3 "协议栈参数 — $(profile_label "$profile")"
+    apply_network_profile "$profile" "$qdisc" "$bw" "$rtt" || return 1
+    step_title 2 3 "全局文件句柄上限"
     apply_ulimit_tuning
+    step_title 3 3 "网卡队列与 RPS/RFS"
     apply_nic_tuning
+    printf '\n  %s%s 全部完成。%s 可随时通过菜单 11 或 net-tune --rollback 一键还原。\n' "${C_GREEN}${C_BOLD}" "$SYM_OK" "${C_RESET}"
+}
+
+# 应用前预览本次将写入的关键参数 (只计算，不修改系统)
+preview_profile() {
+    local profile="$1"
+    local qdisc="${2:-fq}"
+    local bw="${3:-1000}"
+    local rtt="${4:-150}"
+    calculate_buffers "$profile" "$bw" "$rtt"
+
+    local rx_count rps_desc="单核无需 RPS"
+    rx_count="$(nic_queue_count rx)"
+    if [ "$CPU_CORES" -gt 1 ]; then
+        if rps_recommended "$rx_count"; then
+            rps_desc="启用 RPS/RFS (RX 队列 ${rx_count} < ${CPU_CORES} 核)"
+        else
+            rps_desc="RX 队列已覆盖全部核心，不启用 RPS"
+        fi
+    fi
+
+    printf '\n  %s即将应用: %s%s\n' "${C_BOLD}" "$(profile_label "$profile")" "${C_RESET}"
+    print_hr
+    [ "$profile" = "bdp" ] && kv_row "带宽 / RTT" "${bw} Mbps / ${rtt} ms (理论单流 BDP $(human_bytes $(( bw * rtt * 125 ))))"
+    kv_row "拥塞控制 + 队列" "bbr + ${qdisc} (内核不支持时自动保留原算法)"
+    kv_row "单连接缓冲上限" "$(human_bytes "$CALC_MAX_BUF") (内存保护上限 1/16 RAM)"
+    kv_row "默认 Socket 缓冲" "$(human_bytes "$CALC_DEF_RMEM")"
+    kv_row "TCP 内存水位" "$(mem_triplet_mib "$CALC_TCP_MEM") (低 / 压力 / 硬上限)"
+    kv_row "UDP 内存水位" "$(mem_triplet_mib "$CALC_UDP_MEM")"
+    kv_row "文件句柄" "${TARGET_NOFILE} (系统原值更大时保持不变)"
+    kv_row "网卡" "${PRIMARY_NIC:-未检测到} | txqueuelen 10000 | ${rps_desc}"
+    print_hr
+}
+
+# 交互确认，默认 Yes
+confirm_yes() {
+    local ans
+    read -r -p "  $1 [Y/n]: " ans || return 1
+    case "${ans:-Y}" in
+        [yY]|[yY][eE][sS]) return 0 ;;
+        *) log_info "已取消。"; return 1 ;;
+    esac
+}
+
+menu_apply_profile() {
+    local profile="$1" qdisc="${2:-fq}" bw="${3:-1000}" rtt="${4:-150}"
+    preview_profile "$profile" "$qdisc" "$bw" "$rtt"
+    confirm_yes "确认应用以上调优？" || return 0
+    run_full_tune "$profile" "$qdisc" "$bw" "$rtt"
 }
 
 # ============================= 交互式菜单面板 =================================
 pause_prompt() {
     printf '\n'
-    read -r -p "按回车键返回主菜单..." _ || true
+    read -r -p "  按回车键返回主菜单..." _ || true
 }
 
 menu_bdp_wizard() {
     printf '\n%s>>> 跨国大带宽 BDP 精准计算向导%s\n' "${C_BOLD}" "${C_RESET}"
     local bw rtt qdisc_choice qdisc="fq"
-    read -r -p "请输入 VPS 峰值带宽 (Mbps，默认 1000): " bw
+    printf '  %s提示: RTT 可在客户端执行 ping <VPS IP> 获得；带宽填 VPS 标称端口速率即可%s\n\n' "${C_DIM}" "${C_RESET}"
+    read -r -p "  VPS 峰值带宽 (Mbps，默认 1000): " bw
     bw="${bw:-1000}"
-    if ! printf '%s' "$bw" | grep -qE '^[0-9]+$' || [ "$bw" -lt 1 ]; then
-        log_err "带宽输入无效，请输入正整数。"
+    if ! valid_int_range "$bw" 1 100000; then
+        log_err "带宽输入无效，请输入 1-100000 之间的整数。"
         return 1
     fi
 
-    read -r -p "请输入到目标客户端的平均延迟 RTT (ms，默认 160): " rtt
+    read -r -p "  到客户端的平均延迟 RTT (ms，默认 160): " rtt
     rtt="${rtt:-160}"
-    if ! printf '%s' "$rtt" | grep -qE '^[0-9]+$' || [ "$rtt" -lt 1 ]; then
-        log_err "延迟输入无效，请输入正整数。"
+    if ! valid_int_range "$rtt" 1 2000; then
+        log_err "延迟输入无效，请输入 1-2000 之间的整数。"
         return 1
     fi
 
-    read -r -p "选择队列调度算法 [1: fq (默认推荐) / 2: cake]: " qdisc_choice
+    read -r -p "  队列调度算法 [1: fq (默认推荐) / 2: cake]: " qdisc_choice
     [ "${qdisc_choice:-1}" = "2" ] && qdisc="cake"
 
-    local raw_bdp=$(( bw * rtt * 125 ))
-    log_info "理论单流 BDP = $(human_bytes "$raw_bdp")，将自动结合 ${MEM_TOTAL_MB} MiB 内存安全边界计算缓冲上限..."
-    run_full_tune "bdp" "$qdisc" "$bw" "$rtt"
+    menu_apply_profile "bdp" "$qdisc" "$bw" "$rtt"
+}
+
+valid_int_range() {
+    printf '%s' "$1" | grep -qE '^[0-9]{1,9}$' && [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]
 }
 
 menu_switch_qdisc() {
@@ -1626,95 +2147,88 @@ interactive_loop() {
 
     while true; do
         detect_environment
+        clear_screen
         show_dashboard 0
-        printf ' %s1)%s 一键智能调优 — 均衡通用档 %s(推荐：BBR + FQ + 内存自适应缓冲 + 句柄 + 网卡)%s\n' "${C_GREEN}${C_BOLD}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
-        printf ' %s2)%s 跨国大带宽调优 — BDP 精准计算档 %s(输入带宽与 RTT 精准算参)%s\n' "${C_GREEN}${C_BOLD}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
-        printf ' %s3)%s UDP / QUIC 强化档 %s(适配 Hysteria2 / Tuic / WireGuard 高并发防丢包)%s\n' "${C_GREEN}${C_BOLD}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
-        print_hr
-        printf ' %s4)%s 单独切换拥塞控制与队列算法 (BBR / Cubic + FQ / CAKE / FQ_PIE)\n' "${C_CYAN}" "${C_RESET}"
-        printf ' %s5)%s 单独执行文件句柄拉满 (ulimit) 与网卡多队列 (RPS/RFS) 优化\n' "${C_CYAN}" "${C_RESET}"
-        printf ' %s6)%s 启用并扩容 Conntrack 连接跟踪表 (中转 / 防火墙防满表断流)\n' "${C_CYAN}" "${C_RESET}"
-        printf ' %s7)%s 开启 / 关闭 IPv4 & IPv6 流量转发 (ip_forward)\n' "${C_CYAN}" "${C_RESET}"
-        printf ' %s8)%s 切换 IPv4 / IPv6 出站优先级 (/etc/gai.conf)\n' "${C_CYAN}" "${C_RESET}"
-        printf ' %s9)%s Swap 虚拟内存创建与 Swappiness 优化\n' "${C_CYAN}" "${C_RESET}"
-        print_hr
-        printf ' %s10)%s 查看详细内核参数体检报告\n' "${C_YELLOW}" "${C_RESET}"
-        printf ' %s11)%s 一键回滚默认配置 (保留 net-tune 命令，仅还原系统参数)\n' "${C_RED}" "${C_RESET}"
-        printf ' %s12)%s 在线更新脚本 / 彻底卸载 net-tune\n' "${C_BLUE}" "${C_RESET}"
-        printf ' %s0)%s  退出面板 %s(下次直接输入 net-tune 即可唤起)%s\n' "${C_BOLD}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
-        print_hr
+        print_main_menu
 
         local choice
-        if ! read -r -p "请输入菜单编号 [0-12]: " choice; then
+        if ! read -r -p "  请输入菜单编号 [0-12]: " choice; then
             printf '\n'
             break
         fi
 
         case "${choice:-}" in
-            1)
-                run_full_tune "balanced" "fq"
-                pause_prompt
-                ;;
-            2)
-                menu_bdp_wizard || true
-                pause_prompt
-                ;;
-            3)
-                run_full_tune "udp" ""
-                pause_prompt
-                ;;
-            4)
-                menu_switch_qdisc || true
-                pause_prompt
-                ;;
+            1)  menu_apply_profile "balanced" "fq" ;;
+            2)  menu_bdp_wizard || true ;;
+            3)  menu_apply_profile "udp" "fq" ;;
+            4)  menu_switch_qdisc || true ;;
             5)
+                step_title 1 2 "全局文件句柄上限"
                 apply_ulimit_tuning
+                step_title 2 2 "网卡队列与 RPS/RFS"
                 apply_nic_tuning
-                pause_prompt
                 ;;
-            6)
-                tune_conntrack_explicit || true
-                pause_prompt
-                ;;
-            7)
-                menu_forward || true
-                pause_prompt
-                ;;
-            8)
-                menu_ip_pref || true
-                pause_prompt
-                ;;
-            9)
-                menu_swap || true
-                pause_prompt
-                ;;
-            10)
-                show_dashboard 1
-                pause_prompt
-                ;;
+            6)  tune_conntrack_explicit || true ;;
+            7)  menu_forward || true ;;
+            8)  menu_ip_pref || true ;;
+            9)  menu_swap || true ;;
+            10) clear_screen; show_dashboard 1 ;;
             11)
+                printf '\n  将删除 net-tune 写入的所有配置文件，并把内核参数恢复为首次调优前的快照值。\n'
                 local confirm
-                read -r -p "确认清除所有调优配置并恢复备份吗？[y/N]: " confirm
+                read -r -p "  确认回滚？[y/N]: " confirm
                 case "${confirm:-N}" in
                     [yY]|[yY][eE][sS]) rollback_all ;;
                     *) log_info "已取消回滚。" ;;
                 esac
-                pause_prompt
                 ;;
-            12)
-                menu_self_manage || true
-                pause_prompt
-                ;;
+            12) menu_self_manage || true ;;
             0|q|Q)
-                printf '已退出（随时输入 %snet-tune%s 可再次打开面板）。\n' "${C_GREEN}" "${C_RESET}"
+                printf '\n  已退出（随时输入 %snet-tune%s 可再次打开面板）。\n' "${C_GREEN}" "${C_RESET}"
                 exit 0
+                ;;
+            '')
+                continue
                 ;;
             *)
                 log_warn "无效选项: ${choice}"
                 sleep 1
+                continue
                 ;;
         esac
+        pause_prompt
     done
+}
+
+# 菜单一行: 编号 + 标题 (按显示宽度对齐) + 灰色说明
+menu_item() {
+    local num="$1" color="$2" title="$3" desc="${4:-}"
+    if [ -n "$desc" ]; then
+        printf '   %s%3s)%s %s %s%s%s\n' "$color" "$num" "${C_RESET}" "$(pad_to "$title" 30)" "${C_DIM}" "$desc" "${C_RESET}"
+    else
+        printf '   %s%3s)%s %s\n' "$color" "$num" "${C_RESET}" "$title"
+    fi
+}
+
+print_main_menu() {
+    local g="${C_GREEN}${C_BOLD}" c="${C_CYAN}" y="${C_YELLOW}" r="${C_RED}" b="${C_BLUE}"
+    section_title "一键调优 (BBR + 自适应缓冲 + 句柄 + 网卡)"
+    menu_item 1 "$g" "均衡通用档 ${C_GREEN}(推荐)${C_RESET}" "新机首选，适合绝大多数代理 / 反代"
+    menu_item 2 "$g" "BDP 精准计算档" "输入带宽与 RTT 精准算参 (跨国大带宽)"
+    menu_item 3 "$g" "UDP / QUIC 强化档" "Hysteria2 / Tuic / WireGuard"
+    section_title "单项工具"
+    menu_item 4 "$c" "切换拥塞控制与队列算法" "BBR / Cubic + FQ / CAKE / FQ_PIE"
+    menu_item 5 "$c" "文件句柄 + 网卡多队列优化" "ulimit / txqueuelen / RPS"
+    menu_item 6 "$c" "Conntrack 连接跟踪扩容" "中转 / 防火墙防满表断流"
+    menu_item 7 "$c" "IPv4 / IPv6 流量转发" "当前 IPv4=$(read_sysctl net.ipv4.ip_forward)"
+    menu_item 8 "$c" "出站 IPv4 / IPv6 优先级" "当前 $(get_ip_preference)"
+    menu_item 9 "$c" "Swap 虚拟内存管理" "$(get_swap_summary)"
+    section_title "维护"
+    menu_item 10 "$y" "详细体检报告"
+    menu_item 11 "$r" "一键回滚默认配置" "保留 net-tune 命令，仅还原系统参数"
+    menu_item 12 "$b" "在线更新 / 彻底卸载"
+    menu_item 0 "${C_BOLD}" "退出" "下次直接输入 net-tune 唤起"
+    printf '\n'
 }
 
 # ============================= CLI 参数解析 ===================================
@@ -1934,15 +2448,19 @@ main() {
     fi
 
     if [ -n "$target_profile" ]; then
-        require_root
-        [ ! -x "$INSTALL_BIN" ] && install_cli_command 0 || install_cli_command 1 || true
-        if ! printf '%s' "$bw_mbps" | grep -qE '^[0-9]+$' || [ "$bw_mbps" -lt 1 ]; then
-            log_err "--bw 参数无效: ${bw_mbps}"
+        if ! valid_int_range "$bw_mbps" 1 100000; then
+            log_err "--bw 参数无效: ${bw_mbps} (范围 1-100000 Mbps)"
             exit 1
         fi
-        if ! printf '%s' "$rtt_ms" | grep -qE '^[0-9]+$' || [ "$rtt_ms" -lt 1 ]; then
-            log_err "--rtt 参数无效: ${rtt_ms}"
+        if ! valid_int_range "$rtt_ms" 1 2000; then
+            log_err "--rtt 参数无效: ${rtt_ms} (范围 1-2000 ms)"
             exit 1
+        fi
+        require_root
+        if [ ! -x "$INSTALL_BIN" ]; then
+            install_cli_command 0 || true
+        else
+            install_cli_command 1 || true
         fi
         run_full_tune "$target_profile" "$target_qdisc" "$bw_mbps" "$rtt_ms"
     elif [ -n "$target_qdisc" ]; then

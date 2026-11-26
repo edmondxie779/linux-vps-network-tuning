@@ -52,18 +52,21 @@ curl -fsSL https://raw.githubusercontent.com/edmondxie779/linux-vps-network-tuni
 
 1. **原厂内核拥塞控制与队列热切换**
    - 开启 `BBR` 并支持搭配 `fq`（默认推荐）、`cake`、`fq_pie`、`fq_codel`。
-   - 除写入 `sysctl` 外，实时通过 `tc qdisc replace` 热切换主网卡当前队列，**无需重启立即生效**。
+   - 除写入 `sysctl` 外，实时通过 `tc` 热切换主网卡当前队列，**无需重启立即生效**。
+   - 多队列网卡（virtio-net / ENA / gVNIC 等）保留 `mq` 根队列，只替换每个 TX 子队列，不会把多队列退化成单一全局队列。
 2. **BDP（带宽时延积）与内存保护自适应缓冲区**
    - 内置 **均衡通用档 (`balanced`)**、**跨国大带宽精准算参档 (`bdp`)**、**UDP/QUIC 强化档 (`udp`)**。
-   - 根据物理内存设置单连接最大缓冲区硬上限（不超过物理内存的 `1/16`，最高 `128 MiB`），防止 512M/1G 小内存 VPS 在高并发下 OOM 死机。
+   - 根据物理内存设置单连接最大缓冲区硬上限（不超过物理内存的 `1/16`，最高 `128 MiB`）。
+   - 全局协议栈内存总闸 `tcp_mem`（物理内存 6% / 12% / 20%）与 `udp_mem`（4% / 8% / 12%）按字节计算后换算页数（兼容 ARM64 64K 页），防止 512M/1G 小内存 VPS 在高并发下 OOM 死机。
 3. **TCP / UDP 协议栈低延迟与抗并发细调**
    - 开启 `tcp_fastopen = 3`，关闭 `tcp_slow_start_after_idle = 0`（防止代理长连接空闲后掉回慢启动）。
-   - 开启 `tcp_mtu_probing = 1`、`tcp_tw_reuse = 1`，关闭易引发部分运营商丢包的 `tcp_ecn = 0`。
+   - 开启 `tcp_mtu_probing = 1`、`tcp_tw_reuse = 1`；`tcp_ecn = 2`（不主动发起 ECN，但接受对端协商）；`tcp_syn_retries` 保持内核默认，避免跨境丢包链路建连失败。
    - 设置 `tcp_notsent_lowat = 131072`（128 KiB），大幅降低发送缓冲区积压造成的延迟膨胀。
    - 调大 `somaxconn`、`tcp_max_syn_backlog`、`netdev_max_backlog` 与本地端口池 `10240 65535`。
+   - 容量类参数一律**只升不降**：系统原值更大时（如 systemd 默认的 `fs.nr_open = 1073741816`）保持原值。
 4. **全局文件句柄 (`1048576`) 与网卡多队列 (`RPS/RFS`)**
    - 同步打通内核 `fs.file-max`、PAM `limits.d`、Systemd `DefaultLimitNOFILE` 及 Alpine OpenRC `rc_ulimit`。
-   - 自动调优主网卡 `txqueuelen=10000`，多核 VPS 自动计算 CPU 位图激活软中断负载均衡（RPS/RFS）并注册开机持久化。
+   - 自动调优主网卡 `txqueuelen=10000`；仅当网卡 RX 硬件队列数少于 CPU 核数时，按在线 CPU 列表计算位图激活软中断负载均衡（RPS/RFS），并注册开机持久化。
 5. **中转与周边工具箱**
    - **Conntrack 防爆表**：按内存大小扩容 `nf_conntrack_max` 与 `hashsize` 哈希桶，缩短超时回收周期（默认仅在已加载模块或手动开启时介入，避免纯无状态节点额外开销）。
    - **流量转发**：一键开启/关闭 IPv4 & IPv6 `ip_forward`。
@@ -71,7 +74,12 @@ curl -fsSL https://raw.githubusercontent.com/edmondxie779/linux-vps-network-tuni
    - **Swap 管理**：兼容 Ext4 / XFS / Btrfs 创建 `/swapfile` 并设 `vm.swappiness = 10`。
 6. **独立配置、在线自更新与一键无痕回滚**
    - 所有配置采用 `/etc/sysctl.d/99-net-tune.conf` 等独立 drop-in 文件管理，不污染系统原厂 `/etc/sysctl.conf`。
-   - 首次执行自动快照备份至 `/etc/net-tune/backup/`，随时通过菜单或 `net-tune --rollback` 一键还原，或 `net-tune --uninstall` 彻底卸载。
+   - 首次执行自动快照备份至 `/etc/net-tune/backup/`，之后新增的参数也会在首次写入前补记快照；随时通过菜单或 `net-tune --rollback` 一键还原，或 `net-tune --uninstall` 彻底卸载。
+   - 写入后逐项校验参数是否真正生效，并提示会在开机时被 `/etc/sysctl.conf` 等其它配置覆盖的参数。
+7. **交互式面板**
+   - 分区仪表盘：实时显示网卡队列结构、协议栈内存占用与压力线、TCP 连接数、Conntrack 使用率等，并自动体检给出修复建议。
+   - 一键调优前预览将要写入的关键参数（缓冲上限、内存水位、RPS 策略），确认后再执行，执行过程分步显示进度。
+   - 中文标签按显示宽度对齐（不依赖系统 locale），支持 `NO_COLOR` 环境变量关闭彩色输出。
 
 ---
 
